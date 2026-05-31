@@ -1,0 +1,584 @@
+from PIL import Image, ImageDraw, ImageFont
+import io
+from ursina import *
+import random
+import numpy as np
+
+# ========== 参数设置 ==========
+POP_SIZE = 50  # 种群数量
+MAX_STEPS = 500  # 每代最大运行帧数
+VISION_RANGE = 20  # 视野半径
+MAX_SPEED = 10.0  # 最大移动速度
+MAX_TURN = 120.0  # 最大转向速度(度/秒)
+ATTACK_RANGE = 2.5  # 攻击距离
+ATTACK_COOLDOWN = 0.5  # 攻击冷却(秒)
+ATTACK_DAMAGE = 3  # 每次攻击伤害
+HP_INIT = 10  # 初始生命值
+ENERGY_INIT = 100.0  # 初始能量
+METABOLISM = 1.0  # 每秒能量消耗
+单次攻击所消耗的能量 = 5
+KILL_ENERGY = 30.0  # 杀死敌人获得的能量
+MAX_ENERGY = 200.0  # 能量上限
+
+存活时间在适应度中的权重 = 50
+击杀数在适应度中的权重 = 10
+hp在适应度中的权重 = 50
+
+INPUT_NODES = 6  # 神经网络输入层
+HIDDEN_NODES = 8  # 隐藏层节点数
+HIDDEN_NUMBER = 3  # 隐藏层层数
+OUTPUT_NODES = 3  # 输出层(转向、加速、攻击)
+
+MUTATION_RATE = 0.1  # 每个基因变异概率
+MUTATION_SCALE = 0.5  # 变异幅度
+ELITE_COUNT = 10  # 精英保留数量
+CROSSOVER_RATE = 0.7  # 交叉概率
+BOUNDARY = 50  # 平面边界
+
+# 根据 HIDDEN_NUMBER 动态计算基因长度
+def calc_gene_length():
+    length = INPUT_NODES * HIDDEN_NODES          # input -> first hidden
+    length += HIDDEN_NODES                       # bias of first hidden
+    for _ in range(HIDDEN_NUMBER - 1):           # inter hidden layers
+        length += HIDDEN_NODES * HIDDEN_NODES
+        length += HIDDEN_NODES
+    length += HIDDEN_NODES * OUTPUT_NODES        # last hidden -> output
+    length += OUTPUT_NODES
+    return length
+
+GENE_LENGTH = calc_gene_length()
+
+# 基因总长度（权重和偏置）
+# GENE_LENGTH = (INPUT_NODES * HIDDEN_NODES   # 输入到隐藏
+#                +
+#                HIDDEN_NODES                 # 偏置
+#                +
+#                HIDDEN_NODES * OUTPUT_NODES  # 隐藏到输出
+#                +
+#                OUTPUT_NODES)                # 输出偏置
+
+
+
+# ========== 生物实体 ==========
+class Creature(Entity):
+    def __init__(self, population, dna=None, position=None, **kwargs):
+        super().__init__(
+            model='cube',
+            scale=0.8,
+            color=color.random_color(),
+            position=position if position else (
+                random.uniform(-BOUNDARY, BOUNDARY),
+                0,
+                random.uniform(-BOUNDARY, BOUNDARY)
+            ),
+            **kwargs
+        )
+        self.population = population  # 所属种群（由对应的管理器管理）
+        self.alive = True             # 存活状态
+        self.hp = HP_INIT             # 生命值
+        self.energy = ENERGY_INIT     # 能量
+        self.kills = 0                # 击杀数
+        self.survival_time = 0.0      # 存活时间
+        self.survival_step = 0.0      # 存活步数
+        self.attack_cooldown = 0.0    # 冷却
+        self.speed = 0.0              # 速度
+
+        # 创建头顶文字标签（
+        self.tag = Text(
+            text=f'hp: {self.hp} | enger:{round(self.energy, 2)} | kills:{self.kills}',
+            position=self.position + Vec3(0, 0.8, 0),
+            origin=(0, -1),  # 底部中心对齐
+            scale=10,
+            color=color.white33,
+            background=True,
+            background_color=color.black66,
+            parent=scene
+        )
+
+
+
+        # 基因初始化（dna 为一维向量，）
+        if dna is None:
+            self.dna = np.random.randn(GENE_LENGTH) * 0.5
+        else:
+            self.dna = np.array(dna)
+        self.decode_weights()   # 转为该个体的权重
+
+        # 随机初始朝向
+        self.rotation_y = random.uniform(0, 360)
+
+    def decode_weights(self):
+        idx = 0
+        self.weights = []
+        self.biases = []
+
+        # 输入层 → 第一隐藏层
+        w1_size = INPUT_NODES * HIDDEN_NODES
+        W1 = self.dna[idx:idx + w1_size].reshape(INPUT_NODES, HIDDEN_NODES)
+        idx += w1_size
+        b1_size = HIDDEN_NODES
+        b1 = self.dna[idx:idx + b1_size]
+        idx += b1_size
+        self.weights.append(W1)
+        self.biases.append(b1)
+
+        # 中间隐藏层（如果 HIDDEN_NUMBER > 1）
+        for _ in range(HIDDEN_NUMBER - 1):
+            w_size = HIDDEN_NODES * HIDDEN_NODES
+            W = self.dna[idx:idx + w_size].reshape(HIDDEN_NODES, HIDDEN_NODES)
+            idx += w_size
+            b_size = HIDDEN_NODES
+            b = self.dna[idx:idx + b_size]
+            idx += b_size
+            self.weights.append(W)
+            self.biases.append(b)
+
+        # 最后隐藏层 → 输出层
+        w_out_size = HIDDEN_NODES * OUTPUT_NODES
+        W_out = self.dna[idx:idx + w_out_size].reshape(HIDDEN_NODES, OUTPUT_NODES)
+        idx += w_out_size
+        b_out_size = OUTPUT_NODES
+        b_out = self.dna[idx:idx + b_out_size]
+        self.weights.append(W_out)
+        self.biases.append(b_out)
+
+    def get_senses(self):
+        """获取感知输入：最近敌人的相对位置、距离、自身能量"""
+        others = [c for c in self.population.creatures if c is not self and c.alive]  # 存活生物列表
+        if not others:
+            r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY,self.hp, 1.0])
+            if r.shape[0] != INPUT_NODES:
+                print('输入与输出结构不对')
+            return r
+
+        closest = min(others, key=lambda c: distance(self, c))      # 获取最近的生物
+        dist = distance(self, closest)     # 最近生物的运动方向
+        if dist > VISION_RANGE:
+            r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY, self.hp, 1.0])
+            if r.shape[0] != INPUT_NODES:
+                print('输入与输出结构不对')
+            return r
+        # 计算相对位置
+        rel_x = closest.x - self.x
+        rel_z = closest.z - self.z
+
+        # print('id', 'x:', rel_x / VISION_RANGE,'|' ,'z:', rel_z / VISION_RANGE, '|', 'dist:',
+        #                  dist / VISION_RANGE, '|', 'e:',
+        #                  self.energy / MAX_ENERGY, '|', 'h:',
+        #                  self.hp / 10, '|', '1:',
+        #                  1.0)
+        return np.array([rel_x / VISION_RANGE,
+                         rel_z / VISION_RANGE,
+                         dist / VISION_RANGE,
+                         max(0, self.energy) / MAX_ENERGY,
+                         self.hp / 10,
+                         1.0])
+
+    def think(self, inputs):
+        # 隐藏层传播
+        hidden = np.array(inputs)
+        for i in range(HIDDEN_NUMBER):
+            hidden = np.tanh(np.dot(hidden, self.weights[i]) + self.biases[i])
+        # 输出层（最后存储的权重是输出层的）
+        outputs = np.dot(hidden, self.weights[-1]) + self.biases[-1]
+        turn = np.tanh(outputs[0])
+        throttle = 1.0 / (1.0 + np.exp(-outputs[1]))
+        attack_intent = 1.0 / (1.0 + np.exp(-outputs[2]))
+        return turn, throttle, attack_intent
+
+    def attack_target(self, target):
+        """攻击目标生物"""
+        if self.attack_cooldown > 0:  # 为冷却则无法攻击
+            return
+        self.attack_cooldown = ATTACK_COOLDOWN
+        target.hp -= ATTACK_DAMAGE  # 对目标生物造成伤害
+        self.energy -= 单次攻击所消耗的能量          # 攻击消耗能量
+        if target.hp <= 0:  # 目标生物血条清零则亡
+            target.die()
+            self.kills += 1
+            self.energy = min(self.energy + KILL_ENERGY, MAX_ENERGY)
+
+    def die(self):
+        """死亡处理：记录适应度并标记为死亡"""
+        if not self.alive:
+            return
+        self.alive = False
+        self.fitness = self.survival_time + self.kills * 500
+        self.population.dead_records.append((self.dna.copy(), self.fitness))  # 与种群管理器交流
+
+        # 死亡时：固定标签在当前位置，变红变大，显示死亡信息
+        self.tag.position = self.position + Vec3(0, 0.8, 0)
+        self.tag.text = f'enger:{self.energy:.1f} | kills:{self.kills} | s_t: {self.survival_time:.1f} | fitness:{self.fitness}'
+        self.tag.color = color.red
+        self.tag.scale = 30
+    def update(self):
+        """每帧更新：代谢、感知、决策、移动、攻击"""
+        if not self.alive:
+            return
+        self.survival_step += 1
+        dt = time.dt
+        self.survival_time += dt
+        self.energy -= METABOLISM * dt
+        if self.hp <= 0 or self.energy <= 0:  # 能量或生命值低于0时触发死亡
+            self.die()
+            return
+
+        if self.attack_cooldown > 0:
+            self.attack_cooldown -= dt
+
+        # 感知 -> 决策
+        inputs = self.get_senses()
+        turn, throttle, attack_intent = self.think(inputs)
+
+        # 执行移动决策
+        self.rotation_y += turn * MAX_TURN * dt
+        self.speed = throttle * MAX_SPEED
+        self.position += self.forward * self.speed * dt
+
+        # 边界限制
+        self.x = max(-BOUNDARY, min(BOUNDARY, self.x))
+        self.z = max(-BOUNDARY, min(BOUNDARY, self.z))
+
+        # 执行攻击
+        if attack_intent > 0.5:
+            others = [c for c in self.population.creatures if c is not self and c.alive]
+            if others:
+                closest = min(others, key=lambda c: distance(self, c))
+                if distance(self, closest) <= ATTACK_RANGE:
+                    self.attack_target(closest)
+
+        # 颜色反映能量高低
+        ratio = self.energy / MAX_ENERGY
+        self.color = color.rgb(1 - ratio, ratio, 0.2)
+
+        # 存活时：更新标签位置和内容
+        self.tag.position = self.position + Vec3(0, 0.8, 0)
+        self.tag.text = f'hp: {self.hp} | enger:{round(self.energy, 2)} | kills:{self.kills}'
+
+
+class Population:
+    """种群管理器"""
+    def __init__(self):
+        self.creatures = []   # 种群容器
+        self.death_creatures = []
+        self.dead_records = []  # 储存本代所有个体的(基因, 适应度)
+        self.generation = 1    # 进化代数
+        self.step_count = 0    # 步数
+        self.max_fitness = None
+        self.max_fitness_s = []
+        self.max_kill = 0
+        self.average_fitness = []  # 平均适应度
+        self.fig = Entity(
+            model='quad',
+            texture=None,  # 初始为空，稍后动态更新
+            position=(0, 15, 50),  # 放置在场景中合适的位置
+            scale=(40, 30),  # 宽度4，高度3
+            double_sided=True
+        )  # 用于展示统计面版的 面实体
+        self.create_generation()  # 创建第一代
+
+    def create_generation(self):
+        """创建第一代（随机基因）"""
+
+        for c in self.creatures:
+            if c.tag:
+                destroy(c.tag)
+            destroy(c)
+        self.creatures.clear()
+        self.dead_records.clear()
+        self.step_count = 0
+        for _ in range(POP_SIZE):
+            c = Creature(population=self)
+            self.creatures.append(c)
+
+    "============遗传算法============"
+    def evolve(self):
+        # 收集适应度并销毁当前生物（标签会随生物一起被 destroy）
+        # """遗传算法：收集适应度，选择、交叉、变异，生成新一代"""
+        fitness = []
+        kills = []
+        for c in self.creatures:
+            if c.alive:
+                c.fitness = c.survival_step/self.step_count * 存活时间在适应度中的权重 + c.kills * 击杀数在适应度中的权重 + c.hp/HP_INIT * hp在适应度中的权重
+                self.dead_records.append((c.dna.copy(), c.fitness))
+                kills.append(c.kills)
+                fitness.append(c.fitness)
+            destroy(c.tag)
+            destroy(c)
+        for dc in self.death_creatures:
+            destroy(dc.tag)
+            kills.append(dc.kills)
+            destroy(dc)
+        self.creatures.clear()
+        # 收集仍存活个体的数据
+        self.average_fitness.append(sum(fitness)/len(fitness))
+
+        if not self.dead_records:
+            self.create_generation()
+            self.generation += 1
+            return
+
+        # 按适应度降序排列
+        self.dead_records.sort(key=lambda x: x[1], reverse=True)
+        self.max_fitness = self.dead_records[0][-1]
+        self.max_fitness_s.append(self.max_fitness)
+        total_fitness = sum(f for _, f in self.dead_records) or 1
+        # 提取击杀数
+
+        self.max_kill = max(kills)
+        # 精英保留
+        new_dnas = []
+        for i in range(ELITE_COUNT):
+            if i < len(self.dead_records):
+                new_dnas.append(self.dead_records[i][0].copy())
+
+        # 轮盘赌生成剩余个体
+        while len(new_dnas) < POP_SIZE:
+            parent1 = self.roulette_select(total_fitness)
+            parent2 = self.roulette_select(total_fitness)
+            # 交叉
+            if random.random() < CROSSOVER_RATE:
+                cp = random.randint(1, GENE_LENGTH - 1)
+                child = np.concatenate([parent1[:cp], parent2[cp:]])
+            else:
+                child = parent1.copy()
+            # 变异
+            for i in range(GENE_LENGTH):
+                if random.random() < MUTATION_RATE:
+                    child[i] += random.gauss(0, MUTATION_SCALE)
+            new_dnas.append(child)
+
+        self.dead_records.clear()
+
+        # 实例化新一代生物
+        for dna in new_dnas:
+            self.creatures.append(Creature(population=self, dna=dna))
+
+        self.generation += 1
+        self.step_count = 0
+
+    def roulette_select(self, total_fitness):
+        """适应度比例选择"""
+        pick = random.random() * total_fitness
+        current = 0
+        for dna, fit in self.dead_records:
+            current += fit
+            if current >= pick:
+                return dna
+        return self.dead_records[-1][0]
+
+    "==========统计图========="
+    def draw_line(self):
+            """根据当前数据生成折线统计图的纹理"""
+            # ----- 1. 数据准备 -----
+            gens = list(range(1, len(self.max_fitness_s) + 1))
+            max_vals = self.max_fitness_s
+            avg_vals = self.average_fitness
+            if not gens :
+                # 无数据时返回空白纹理
+                return Texture('white_cube')
+
+            # ----- 2. 图片参数 -----
+            width, height = 800, 600  # 图片分辨率
+            margin = 80  # 四周留白（用于绘制坐标轴标签）
+            plot_width = width - 2 * margin
+            plot_height = height - 2 * margin
+
+            # 坐标范围
+            x_min, x_max = min(gens), max(gens)
+            y_min = min(min(max_vals), min(avg_vals))
+            y_max = max(max(max_vals), max(avg_vals))
+            # 留出一些边距，避免线条贴边
+            y_padding = (y_max - y_min) * 0.1
+            y_min -= y_padding
+            y_max += y_padding
+            if y_min == y_max:
+                y_min, y_max = y_min - 1, y_max + 1
+
+            # 映射函数：数据坐标 -> 图片像素坐标
+            if x_max == x_min:
+                # 只有一个数据点，固定X坐标在绘图区域中央
+                def map_x(gen):
+                    return margin + plot_width / 2
+            else:
+                def map_x(gen):
+                    return margin + (gen - x_min) / (x_max - x_min) * plot_width
+
+            if y_max == y_min:
+                def map_y(value):
+                    return height - margin - plot_height / 2
+            else:
+                def map_y(value):
+                    return height - margin - (value - y_min) / (y_max - y_min) * plot_height
+
+            # ----- 3. 创建空白图片并绘制 -----
+            img = Image.new('RGBA', (width, height), (255, 255, 255, 255))  # 白色背景
+            draw = ImageDraw.Draw(img)
+
+            # 尝试加载字体（如果没有系统字体，可以使用默认）
+            try:
+                font = ImageFont.truetype("arial.ttf", 24)
+                small_font = ImageFont.truetype("arial.ttf", 18)
+            except:
+                font = ImageFont.load_default()
+                small_font = font
+
+            # ----- 4. 绘制坐标轴 -----
+            # X 轴 (水平线)
+            draw.line([(margin, height - margin), (width - margin, height - margin)], fill='black', width=3)
+            # Y 轴 (垂直线)
+            draw.line([(margin, margin), (margin, height - margin)], fill='black', width=3)
+
+
+            # 绘制 X 轴刻度标签
+            max_ticks = max(5, int(plot_width // 50))  # 每50px一个标签，最多至少5个
+            step = max(1, len(gens) // max_ticks)
+            tick_gens = gens[::step]
+            if gens[0] not in tick_gens:
+                tick_gens.insert(0, gens[0])
+            if gens[-1] not in tick_gens:
+                tick_gens.append(gens[-1])
+
+            for gen in tick_gens:
+                x = map_x(gen)
+                draw.line([(x, height - margin - 5), (x, height - margin + 5)], fill='black', width=2)
+                # 绘制文本，尝试居中对齐
+                text_str = str(gen)
+                try:
+                    # Pillow 10.0+ 支持 getlength
+                    text_w = small_font.getlength(text_str)
+                except AttributeError:
+                    # 回退方法：每个字符大约宽度为字体大小的一半
+                    text_w = len(text_str) * (small_font.size if hasattr(small_font, 'size') else 12) * 0.6
+                draw.text((x - text_w / 2, height - margin + 8), text_str, fill='black', font=small_font)
+
+            # 绘制 Y 轴刻度标签（简单取5个等分点）
+            for i in range(5):
+                t = i / 4
+                value = y_min + t * (y_max - y_min)
+                y = map_y(value)
+                draw.line([(margin - 5, y), (margin + 5, y)], fill='black', width=2)
+                draw.text((margin - 50, y - 12), f'{value:.2f}', fill='black', font=small_font)
+
+            # 坐标轴标题
+            draw.text((width // 2 - 30, height - 30), "Generation", fill='black', font=font)
+            # 旋转Y轴标题需要单独处理，这里简单写竖排？可以画个文本框，不细究
+            draw.text((20, height // 2), "Fitness", fill='black', font=font, angle=90)
+
+            # ----- 5. 绘制折线 -----
+            # 最大适应度折线 (红色)
+            max_points = [(map_x(g), map_y(v)) for g, v in zip(gens, max_vals)]
+            draw.line(max_points, fill='red', width=4, joint='curve')
+            # 平均适应度折线 (蓝色)
+            avg_points = [(map_x(g), map_y(v)) for g, v in zip(gens, avg_vals)]
+            draw.line(avg_points, fill='blue', width=4, joint='curve')
+
+            # 绘制数据点标记 (圆点)
+            for x, y in max_points:
+                draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='red', outline='darkred')
+            for x, y in avg_points:
+                draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='blue', outline='darkblue')
+
+            # 添加图例
+            draw.rectangle([width - 150, 40, width - 20, 90], outline='black', width=2)
+            draw.ellipse([width - 140, 52, width - 120, 72], fill='red')
+            draw.text((width - 110, 55), "Max Fitness", fill='black', font=small_font)
+            draw.ellipse([width - 140, 77, width - 120, 97], fill='blue')
+            draw.text((width - 110, 80), "Avg Fitness", fill='black', font=small_font)
+
+            # ----- 6. 转换为 Ursina Texture -----
+            # 将 PIL Image 转为 bytes
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+
+            # 创建纹理
+            texture = Texture(img)
+            return texture
+            # texture = Texture(img_bytes.getvalue())
+            # return texture
+
+    "==========更新函数========"  # 此局开始到 下一代生成过程，均在这里
+    def update(self):
+        self.step_count += 1
+        # 更新所有生物，移除已死亡实体
+        idc = 0
+        for c in self.creatures[:]:
+            if c.alive:
+                c.update()
+                # self.text[idc].position = (c.position[0], c.position[1]+0.5, c.position[2])
+                # self.text[idc].text = f'hp: {c.hp} | enger:{round(c.energy, 2)} | kills:{c.kills}'
+                # self.text[idc].color = color.white33
+                # self.text[idc].scale = 10
+            else:
+                self.death_creatures.append(c)
+                self.creatures.remove(c)
+            # self.text[idc].look_at(camera)
+            idc += 1
+
+        """
+          self.alive = True
+        self.hp = HP_INIT
+        self.energy = ENERGY_INIT
+        self.kills = 0
+        self.survival_time = 0.0
+        self.attack_cooldown = 0.0
+        self.speed = 0.0
+        """
+        # 达到终止条件则进化
+        if len(self.creatures) == 0 or self.step_count >= MAX_STEPS:
+            self.evolve()
+            new_tex = self.draw_line()
+            self.fig.texture = new_tex
+
+
+# ========== 启动 Ursina ==========
+app = Ursina()
+window.title = 'Genetic Algorithm Battle'
+window.borderless = False
+
+
+
+# 场景
+ground = Entity(model='plane', scale=100, texture='white_cube',
+                texture_scale=(10, 10), color=color.gray, rotation_x=0)
+for pos in [50, -50]:
+    Entity(model='cube', scale=(100, 0.1, 0.5), position=(0, 0, pos), color=color.white)
+    Entity(model='cube', scale=(0.5, 0.1, 100), position=(pos, 0, 0), color=color.white)
+
+# 加载图片纹理（支持 png, jpg 等）
+my_texture = load_texture('图片1')   # 请替换为实际路径
+
+# 创建一个平面实体，贴上图片
+picture = Entity(
+    model='quad',           # 平面模型
+    texture=my_texture,
+    scale=(10, 10),         # 宽度10，高度10
+    position=(-50, 5, 50),     # 放在地面上方5单位处
+    double_sided=True       # 双面可见（可选）
+)
+
+
+camera = EditorCamera()  # 该实体默认为编辑器摄像机
+camera.position = (0, 60, -60)
+camera.rotation = (45, 0, 0)
+
+# 信息显示
+info = Text(text='', position=(-0.8, 0.45), scale=1.5, background=True)
+
+
+population = Population()
+
+
+def update():
+    picture.look_at(camera)
+    population.update()
+    info.text = (f'Generation: {population.generation}\n'
+                 f'Alive: {len(population.creatures)}\n'
+                 f'Steps: {population.step_count}\n'
+                 f'Gen:{population.generation} | max fitness:{population.max_fitness}'
+                 f' | max kill:{population.max_kill}'
+                 )
+
+
+app.run()
