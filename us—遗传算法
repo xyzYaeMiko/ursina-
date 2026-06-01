@@ -1,3 +1,5 @@
+import json
+
 from PIL import Image, ImageDraw, ImageFont
 import io
 from ursina import *
@@ -6,7 +8,7 @@ import numpy as np
 
 # ========== 参数设置 ==========
 POP_SIZE = 50  # 种群数量
-MAX_STEPS = 500  # 每代最大运行帧数
+MAX_STEPS = 3000  # 每代最大运行帧数
 VISION_RANGE = 20  # 视野半径
 MAX_SPEED = 10.0  # 最大移动速度
 MAX_TURN = 120.0  # 最大转向速度(度/秒)
@@ -17,12 +19,13 @@ HP_INIT = 10  # 初始生命值
 ENERGY_INIT = 100.0  # 初始能量
 METABOLISM = 1.0  # 每秒能量消耗
 单次攻击所消耗的能量 = 5
-KILL_ENERGY = 30.0  # 杀死敌人获得的能量
+KILL_ENERGY = 20.0  # 杀死敌人获得的能量
+击杀治愈 = 5
 MAX_ENERGY = 200.0  # 能量上限
 
-存活时间在适应度中的权重 = 50
-击杀数在适应度中的权重 = 10
-hp在适应度中的权重 = 50
+存活时间在适应度中的权重 = 10
+击杀数在适应度中的权重 = 500
+hp在适应度中的权重 = 10
 
 INPUT_NODES = 6  # 神经网络输入层
 HIDDEN_NODES = 8  # 隐藏层节点数
@@ -68,7 +71,7 @@ class Creature(Entity):
             color=color.random_color(),
             position=position if position else (
                 random.uniform(-BOUNDARY, BOUNDARY),
-                0,
+                0.5,
                 random.uniform(-BOUNDARY, BOUNDARY)
             ),
             **kwargs
@@ -82,13 +85,14 @@ class Creature(Entity):
         self.survival_step = 0.0      # 存活步数
         self.attack_cooldown = 0.0    # 冷却
         self.speed = 0.0              # 速度
+        self.max_speed = MAX_SPEED
 
         # 创建头顶文字标签（
         self.tag = Text(
             text=f'hp: {self.hp} | enger:{round(self.energy, 2)} | kills:{self.kills}',
             position=self.position + Vec3(0, 0.8, 0),
             origin=(0, -1),  # 底部中心对齐
-            scale=10,
+            scale=20,
             color=color.white33,
             background=True,
             background_color=color.black66,
@@ -142,38 +146,98 @@ class Creature(Entity):
         self.weights.append(W_out)
         self.biases.append(b_out)
 
+    # def get_senses(self):
+    #     """获取感知输入：最近敌人的相对位置、距离、自身能量"""
+    #     others = [c for c in self.population.creatures if c is not self and c.alive]  # 存活生物列表
+    #     if not others:
+    #         r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY,self.hp, 1.0])
+    #         if r.shape[0] != INPUT_NODES:
+    #             print('输入与输出结构不对')
+    #         return r
+    #
+    #     closest = min(others, key=lambda c: distance(self, c))      # 获取最近的生物
+    #     dist = distance(self, closest)     # 最近生物的运动方向
+    #     if dist > VISION_RANGE:
+    #         r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY, self.hp, 1.0])
+    #         if r.shape[0] != INPUT_NODES:
+    #             print('输入与输出结构不对')
+    #         return r
+    #     # 计算相对位置
+    #     rel_x = closest.x - self.x
+    #     rel_z = closest.z - self.z
+    #
+    #     # print('id', 'x:', rel_x / VISION_RANGE,'|' ,'z:', rel_z / VISION_RANGE, '|', 'dist:',
+    #     #                  dist / VISION_RANGE, '|', 'e:',
+    #     #                  self.energy / MAX_ENERGY, '|', 'h:',
+    #     #                  self.hp / 10, '|', '1:',
+    #     #                  1.0)
+    #     return np.array([rel_x / VISION_RANGE,
+    #                      rel_z / VISION_RANGE,
+    #                      dist / VISION_RANGE,
+    #                      max(0, self.energy) / MAX_ENERGY,
+    #                      self.hp / 10,
+    #                      1.0])
+
     def get_senses(self):
-        """获取感知输入：最近敌人的相对位置、距离、自身能量"""
-        others = [c for c in self.population.creatures if c is not self and c.alive]  # 存活生物列表
+        """获取感知输入：转换世界相对坐标为基于自身车头朝向的局部相对坐标"""
+        # 获取所有存活的敌对生物
+        others = [c for c in self.population.creatures if c is not self and c.alive]
+
+        # 兜底：如果没有其他生物，给神经网络输入默认值（全0，维持当前状态）
         if not others:
-            r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY,self.hp, 1.0])
-            if r.shape[0] != INPUT_NODES:
-                print('输入与输出结构不对')
-            return r
+            return np.array([
+                0.0, 0.0,  # 局部相对位置 (前/后, 右/左)
+                1.0,  # 距离归一化（1.0表示极远或没有目标）
+                max(0.0, self.energy) / MAX_ENERGY,
+                self.hp / HP_INIT,
+                1.0  # 偏置常数
+            ])
 
-        closest = min(others, key=lambda c: distance(self, c))      # 获取最近的生物
-        dist = distance(self, closest)     # 最近生物的运动方向
+        # 找到最近的敌人
+        closest = min(others, key=lambda c: distance(self, c))
+        dist = distance(self, closest)
+
+        # 兜底：如果敌人超出了视野范围
         if dist > VISION_RANGE:
-            r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY, self.hp, 1.0])
-            if r.shape[0] != INPUT_NODES:
-                print('输入与输出结构不对')
-            return r
-        # 计算相对位置
-        rel_x = closest.x - self.x
-        rel_z = closest.z - self.z
+            return np.array([
+                0.0, 0.0,
+                1.0,
+                max(0.0, self.energy) / MAX_ENERGY,
+                self.hp / HP_INIT,
+                1.0
+            ])
 
-        # print('id', 'x:', rel_x / VISION_RANGE,'|' ,'z:', rel_z / VISION_RANGE, '|', 'dist:',
-        #                  dist / VISION_RANGE, '|', 'e:',
-        #                  self.energy / MAX_ENERGY, '|', 'h:',
-        #                  self.hp / 10, '|', '1:',
-        #                  1.0)
-        return np.array([rel_x / VISION_RANGE,
-                         rel_z / VISION_RANGE,
-                         dist / VISION_RANGE,
-                         max(0, self.energy) / MAX_ENERGY,
-                         self.hp / 10,
-                         1.0])
+        # ========== 核心：局部坐标系转换 ==========
 
+        # 1. 计算从“我”指向“敌人”的世界坐标系向量 (3D Vec3)
+        # Ursina 中：+X 是右，+Y 是上，+Z 是前
+        to_target = closest.position - self.position
+        # 将高度差 Y 清零，只保留地面 X-Z 平面的向量并归一化
+        to_target_2d = Vec3(to_target.x, 0, to_target.z).normalized()
+
+        # 2. 获取生物当前车头的正前方向量 (已由 Ursina 自动随 rotation_y 更新，且为单位向量)
+        my_forward = self.forward.normalized()
+
+        # 3. 点积 (Dot Product) -> 判断目标在 [前/后]
+        # 当两个单位向量完全同向时为 1.0 (正前方)，完全反向时为 -1.0 (正后方)
+        forward_component = my_forward.dot(to_target_2d)
+
+        # 4. 叉积 (Cross Product) -> 判断目标在 [右/左]
+        # 3D向量叉积得到一个垂直于地面的向量，其 Y 轴的正负号直接反映了左右关系
+        # 在 Ursina 右手坐标系下：Y为正表示目标在右手边，Y为负表示目标在左手边
+        cross_product = my_forward.cross(to_target_2d)
+        right_component = cross_product.y
+
+        # ========== 组装输入向量 ==========
+        # 所有输入范围均控制在 [-1.0, 1.0] 之间，极度利于神经网络收敛
+        return np.array([
+            forward_component,  # 前后感受：1.0(正前), -1.0(正后)
+            right_component,  # 左右感受：1.0(正右), -1.0(正左)
+            dist / VISION_RANGE,  # 距离感受：0.0(贴脸), 1.0(视野边缘)
+            max(0.0, self.energy) / MAX_ENERGY,  # 自身能量比例 [0, 1]
+            self.hp / HP_INIT,  # 自身血量比例 [0, 1]
+            1.0  # 偏置项
+        ])
     def think(self, inputs):
         # 隐藏层传播
         hidden = np.array(inputs)
@@ -196,6 +260,7 @@ class Creature(Entity):
         if target.hp <= 0:  # 目标生物血条清零则亡
             target.die()
             self.kills += 1
+            self.hp = min(self.hp + 击杀治愈, HP_INIT)
             self.energy = min(self.energy + KILL_ENERGY, MAX_ENERGY)
 
     def die(self):
@@ -208,9 +273,8 @@ class Creature(Entity):
 
         # 死亡时：固定标签在当前位置，变红变大，显示死亡信息
         self.tag.position = self.position + Vec3(0, 0.8, 0)
-        self.tag.text = f'enger:{self.energy:.1f} | kills:{self.kills} | s_t: {self.survival_time:.1f} | fitness:{self.fitness}'
+        self.tag.text = f'enger:{self.energy:.1f} | kills:{self.kills} | s_t: {self.survival_time:.1f} | fitness:{round(self.fitness, 2)}'
         self.tag.color = color.red
-        self.tag.scale = 30
     def update(self):
         """每帧更新：代谢、感知、决策、移动、攻击"""
         if not self.alive:
@@ -219,7 +283,10 @@ class Creature(Entity):
         dt = time.dt
         self.survival_time += dt
         self.energy -= METABOLISM * dt
-        if self.hp <= 0 or self.energy <= 0:  # 能量或生命值低于0时触发死亡
+        if self.energy <= 0:  # 能量为0时， 扣生命值，不断减少速度
+            self.max_speed = MAX_SPEED * self.hp /HP_INIT
+            self.hp -= 0.001
+        if self.hp <= 0 :  # 能量或生命值低于0时触发死亡
             self.die()
             return
 
@@ -232,7 +299,7 @@ class Creature(Entity):
 
         # 执行移动决策
         self.rotation_y += turn * MAX_TURN * dt
-        self.speed = throttle * MAX_SPEED
+        self.speed = throttle * self.max_speed
         self.position += self.forward * self.speed * dt
 
         # 边界限制
@@ -259,15 +326,17 @@ class Creature(Entity):
 class Population:
     """种群管理器"""
     def __init__(self):
+        self.img = None
         self.creatures = []   # 种群容器
         self.death_creatures = []
         self.dead_records = []  # 储存本代所有个体的(基因, 适应度)
         self.generation = 1    # 进化代数
         self.step_count = 0    # 步数
-        self.max_fitness = None
+        self.max_fitness = 0
         self.max_fitness_s = []
         self.max_kill = 0
-        self.average_fitness = []  # 平均适应度
+        self.average_fitness = 0
+        self.average_fitness_s = []  # 平均适应度
         self.fig = Entity(
             model='quad',
             texture=None,  # 初始为空，稍后动态更新
@@ -308,11 +377,13 @@ class Population:
         for dc in self.death_creatures:
             destroy(dc.tag)
             kills.append(dc.kills)
+            fitness.append(dc.fitness)
             destroy(dc)
         self.creatures.clear()
+        self.death_creatures.clear()
         # 收集仍存活个体的数据
-        self.average_fitness.append(sum(fitness)/len(fitness))
-
+        self.average_fitness = sum(fitness) / len(fitness)
+        self.average_fitness_s.append(self.average_fitness)
         if not self.dead_records:
             self.create_generation()
             self.generation += 1
@@ -368,136 +439,260 @@ class Population:
         return self.dead_records[-1][0]
 
     "==========统计图========="
+    # def draw_line(self):
+    #         """根据当前数据生成折线统计图的纹理"""
+    #         # ----- 1. 数据准备 -----
+    #         gens = list(range(1, len(self.max_fitness_s) + 1))
+    #         max_vals = self.max_fitness_s
+    #         avg_vals = self.average_fitness_s
+    #         if not gens :
+    #             # 无数据时返回空白纹理
+    #             return Texture('white_cube')
+    #
+    #         # ----- 2. 图片参数 -----
+    #         width, height = 800, 600  # 图片分辨率
+    #         margin = 80  # 四周留白（用于绘制坐标轴标签）
+    #         plot_width = width - 2 * margin
+    #         plot_height = height - 2 * margin
+    #
+    #         # 坐标范围
+    #         x_min, x_max = min(gens), max(gens)
+    #         y_min = min(min(max_vals), min(avg_vals))
+    #         y_max = max(max(max_vals), max(avg_vals))
+    #         # 留出一些边距，避免线条贴边
+    #         y_padding = (y_max - y_min) * 0.1
+    #         y_min -= y_padding
+    #         y_max += y_padding
+    #         if y_min == y_max:
+    #             y_min, y_max = y_min - 1, y_max + 1
+    #
+    #         # 映射函数：数据坐标 -> 图片像素坐标
+    #         if x_max == x_min:
+    #             # 只有一个数据点，固定X坐标在绘图区域中央
+    #             def map_x(gen):
+    #                 return margin + plot_width / 2
+    #         else:
+    #             def map_x(gen):
+    #                 return margin + (gen - x_min) / (x_max - x_min) * plot_width
+    #
+    #         if y_max == y_min:
+    #             def map_y(value):
+    #                 return height - margin - plot_height / 2
+    #         else:
+    #             def map_y(value):
+    #                 return height - margin - (value - y_min) / (y_max - y_min) * plot_height
+    #
+    #         # ----- 3. 创建空白图片并绘制 -----
+    #         img = Image.new('RGBA', (width, height), (255, 255, 255, 255))  # 白色背景
+    #         draw = ImageDraw.Draw(img)
+    #
+    #         # 尝试加载字体（如果没有系统字体，可以使用默认）
+    #         try:
+    #             font = ImageFont.truetype("arial.ttf", 24)
+    #             small_font = ImageFont.truetype("arial.ttf", 18)
+    #         except:
+    #             font = ImageFont.load_default()
+    #             small_font = font
+    #
+    #         # ----- 4. 绘制坐标轴 -----
+    #         # X 轴 (水平线)
+    #         draw.line([(margin, height - margin), (width - margin, height - margin)], fill='black', width=3)
+    #         # Y 轴 (垂直线)
+    #         draw.line([(margin, margin), (margin, height - margin)], fill='black', width=3)
+    #
+    #
+    #         # 绘制 X 轴刻度标签
+    #         max_ticks = max(5, int(plot_width // 50))  # 每50px一个标签，最多至少5个
+    #         step = max(1, len(gens) // max_ticks)
+    #         tick_gens = gens[::step]
+    #         if gens[0] not in tick_gens:
+    #             tick_gens.insert(0, gens[0])
+    #         if gens[-1] not in tick_gens:
+    #             tick_gens.append(gens[-1])
+    #
+    #         for gen in tick_gens:
+    #             x = map_x(gen)
+    #             draw.line([(x, height - margin - 5), (x, height - margin + 5)], fill='black', width=2)
+    #             # 绘制文本，尝试居中对齐
+    #             text_str = str(gen)
+    #             try:
+    #                 # Pillow 10.0+ 支持 getlength
+    #                 text_w = small_font.getlength(text_str)
+    #             except AttributeError:
+    #                 # 回退方法：每个字符大约宽度为字体大小的一半
+    #                 text_w = len(text_str) * (small_font.size if hasattr(small_font, 'size') else 12) * 0.6
+    #             draw.text((x - text_w / 2, height - margin + 8), text_str, fill='black', font=small_font)
+    #
+    #         # 绘制 Y 轴刻度标签（简单取5个等分点）
+    #         for i in range(5):
+    #             t = i / 4
+    #             value = y_min + t * (y_max - y_min)
+    #             y = map_y(value)
+    #             draw.line([(margin - 5, y), (margin + 5, y)], fill='black', width=2)
+    #             draw.text((margin - 50, y - 12), f'{value:.2f}', fill='black', font=small_font)
+    #
+    #         # 坐标轴标题
+    #         draw.text((width // 2 - 30, height - 30), "Generation", fill='black', font=font)
+    #         # 旋转Y轴标题需要单独处理，这里简单写竖排？可以画个文本框，不细究
+    #         draw.text((20, height // 2), "Fitness", fill='black', font=font, angle=90)
+    #
+    #         # ----- 5. 绘制折线 -----
+    #         # 最大适应度折线 (红色)
+    #         max_points = [(map_x(g), map_y(v)) for g, v in zip(gens, max_vals)]
+    #         draw.line(max_points, fill='red', width=4, joint='curve')
+    #         # 平均适应度折线 (蓝色)
+    #         avg_points = [(map_x(g), map_y(v)) for g, v in zip(gens, avg_vals)]
+    #         draw.line(avg_points, fill='blue', width=4, joint='curve')
+    #
+    #         # 绘制数据点标记 (圆点)
+    #         for x, y in max_points:
+    #             draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='red', outline='darkred')
+    #         for x, y in avg_points:
+    #             draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='blue', outline='darkblue')
+    #
+    #         # 添加图例
+    #         draw.rectangle([width - 150, 40, width - 20, 90], outline='black', width=2)
+    #         draw.ellipse([width - 140, 52, width - 120, 72], fill='red')
+    #         draw.text((width - 110, 55), "Max Fitness", fill='black', font=small_font)
+    #         draw.ellipse([width - 140, 77, width - 120, 97], fill='blue')
+    #         draw.text((width - 110, 80), "Avg Fitness", fill='black', font=small_font)
+    #
+    #         # ----- 6. 转换为 Ursina Texture -----
+    #         # 将 PIL Image 转为 bytes
+    #         img_bytes = io.BytesIO()
+    #         img.save(img_bytes, format='PNG')
+    #         img_bytes.seek(0)
+    #
+    #         # 创建纹理
+    #         texture = Texture(img)
+    #         return texture
+    #         # texture = Texture(img_bytes.getvalue())
+    #         # return texture
     def draw_line(self):
-            """根据当前数据生成折线统计图的纹理"""
-            # ----- 1. 数据准备 -----
-            gens = list(range(1, len(self.max_fitness_s) + 1))
-            max_vals = self.max_fitness_s
-            avg_vals = self.average_fitness
-            if not gens :
-                # 无数据时返回空白纹理
-                return Texture('white_cube')
+        """根据当前数据生成【双Y轴】折线统计图的纹理（已修复 TypeError 和除零崩溃）"""
+        gens = list(range(1, len(self.max_fitness_s) + 1))
+        max_vals = self.max_fitness_s
+        avg_vals = self.average_fitness_s
 
-            # ----- 2. 图片参数 -----
-            width, height = 800, 600  # 图片分辨率
-            margin = 80  # 四周留白（用于绘制坐标轴标签）
-            plot_width = width - 2 * margin
-            plot_height = height - 2 * margin
+        # 兜底1：无数据时返回空白纹理
+        if not gens or not max_vals or not avg_vals:
+            return Texture(Image.new('RGBA', (10, 10), (255, 255, 255, 255)))
 
-            # 坐标范围
-            x_min, x_max = min(gens), max(gens)
-            y_min = min(min(max_vals), min(avg_vals))
-            y_max = max(max(max_vals), max(avg_vals))
-            # 留出一些边距，避免线条贴边
-            y_padding = (y_max - y_min) * 0.1
-            y_min -= y_padding
-            y_max += y_padding
-            if y_min == y_max:
-                y_min, y_max = y_min - 1, y_max + 1
+        # ----- 1. 图片尺寸与留白 -----
+        width, height = 900, 600
+        margin_left = 90
+        margin_right = 90
+        margin_top = 80
+        margin_bottom = 80
 
-            # 映射函数：数据坐标 -> 图片像素坐标
-            if x_max == x_min:
-                # 只有一个数据点，固定X坐标在绘图区域中央
-                def map_x(gen):
-                    return margin + plot_width / 2
-            else:
-                def map_x(gen):
-                    return margin + (gen - x_min) / (x_max - x_min) * plot_width
+        plot_width = width - margin_left - margin_right
+        plot_height = height - margin_top - margin_bottom
 
-            if y_max == y_min:
-                def map_y(value):
-                    return height - margin - plot_height / 2
-            else:
-                def map_y(value):
-                    return height - margin - (value - y_min) / (y_max - y_min) * plot_height
+        # ----- 2. 计算左右Y轴的各自范围（增强兜底，防止单个 float 报错与除零） -----
+        # 处理左轴（最大适应度）
+        y1_raw_min = min(max_vals) if isinstance(max_vals, (list, np.ndarray)) else max_vals
+        y1_raw_max = max(max_vals) if isinstance(max_vals, (list, np.ndarray)) else max_vals
 
-            # ----- 3. 创建空白图片并绘制 -----
-            img = Image.new('RGBA', (width, height), (255, 255, 255, 255))  # 白色背景
-            draw = ImageDraw.Draw(img)
+        if y1_raw_max == y1_raw_min:
+            y1_min, y1_max = y1_raw_min - 1.0, y1_raw_max + 1.0
+        else:
+            y1_padding = (y1_raw_max - y1_raw_min) * 0.1
+            y1_min = y1_raw_min - y1_padding
+            y1_max = y1_raw_max + y1_padding
 
-            # 尝试加载字体（如果没有系统字体，可以使用默认）
-            try:
-                font = ImageFont.truetype("arial.ttf", 24)
-                small_font = ImageFont.truetype("arial.ttf", 18)
-            except:
-                font = ImageFont.load_default()
-                small_font = font
+        # 处理右轴（平均适应度）
+        y2_raw_min = min(avg_vals) if isinstance(avg_vals, (list, np.ndarray)) else avg_vals
+        y2_raw_max = max(avg_vals) if isinstance(avg_vals, (list, np.ndarray)) else avg_vals
 
-            # ----- 4. 绘制坐标轴 -----
-            # X 轴 (水平线)
-            draw.line([(margin, height - margin), (width - margin, height - margin)], fill='black', width=3)
-            # Y 轴 (垂直线)
-            draw.line([(margin, margin), (margin, height - margin)], fill='black', width=3)
+        if y2_raw_max == y2_raw_min:
+            y2_min, y2_max = y2_raw_min - 1.0, y2_raw_max + 1.0
+        else:
+            y2_padding = (y2_raw_max - y2_raw_min) * 0.1
+            y2_min = y2_raw_min - y2_padding
+            y2_max = y2_raw_max + y2_padding
 
+        # ----- 3. 坐标映射函数 -----
+        def map_x(gen):
+            if len(gens) <= 1:
+                return margin_left + plot_width / 2
+            return margin_left + (gen - 1) / (len(gens) - 1) * plot_width
 
-            # 绘制 X 轴刻度标签
-            max_ticks = max(5, int(plot_width // 50))  # 每50px一个标签，最多至少5个
-            step = max(1, len(gens) // max_ticks)
-            tick_gens = gens[::step]
-            if gens[0] not in tick_gens:
-                tick_gens.insert(0, gens[0])
-            if gens[-1] not in tick_gens:
-                tick_gens.append(gens[-1])
+        def map_y_left(value):
+            return height - margin_bottom - (value - y1_min) / (y1_max - y1_min) * plot_height
 
-            for gen in tick_gens:
-                x = map_x(gen)
-                draw.line([(x, height - margin - 5), (x, height - margin + 5)], fill='black', width=2)
-                # 绘制文本，尝试居中对齐
-                text_str = str(gen)
-                try:
-                    # Pillow 10.0+ 支持 getlength
-                    text_w = small_font.getlength(text_str)
-                except AttributeError:
-                    # 回退方法：每个字符大约宽度为字体大小的一半
-                    text_w = len(text_str) * (small_font.size if hasattr(small_font, 'size') else 12) * 0.6
-                draw.text((x - text_w / 2, height - margin + 8), text_str, fill='black', font=small_font)
+        def map_y_right(value):
+            return height - margin_bottom - (value - y2_min) / (y2_max - y2_min) * plot_height
 
-            # 绘制 Y 轴刻度标签（简单取5个等分点）
-            for i in range(5):
-                t = i / 4
-                value = y_min + t * (y_max - y_min)
-                y = map_y(value)
-                draw.line([(margin - 5, y), (margin + 5, y)], fill='black', width=2)
-                draw.text((margin - 50, y - 12), f'{value:.2f}', fill='black', font=small_font)
+        # ----- 4. 绘制图像 -----
+        img = Image.new('RGBA', (width, height), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(img)
 
-            # 坐标轴标题
-            draw.text((width // 2 - 30, height - 30), "Generation", fill='black', font=font)
-            # 旋转Y轴标题需要单独处理，这里简单写竖排？可以画个文本框，不细究
-            draw.text((20, height // 2), "Fitness", fill='black', font=font, angle=90)
+        try:
+            font = ImageFont.truetype("arial.ttf", 22)
+            small_font = ImageFont.truetype("arial.ttf", 16)
+        except:
+            font = ImageFont.load_default()
+            small_font = font
 
-            # ----- 5. 绘制折线 -----
-            # 最大适应度折线 (红色)
-            max_points = [(map_x(g), map_y(v)) for g, v in zip(gens, max_vals)]
-            draw.line(max_points, fill='red', width=4, joint='curve')
-            # 平均适应度折线 (蓝色)
-            avg_points = [(map_x(g), map_y(v)) for g, v in zip(gens, avg_vals)]
-            draw.line(avg_points, fill='blue', width=4, joint='curve')
+        # ----- 5. 绘制三条轴线 -----
+        draw.line([(margin_left, height - margin_bottom), (width - margin_right, height - margin_bottom)], fill='black',
+                  width=3)
+        draw.line([(margin_left, margin_top), (margin_left, height - margin_bottom)], fill='red', width=3)
+        draw.line([(width - margin_right, margin_top), (width - margin_right, height - margin_bottom)], fill='blue',
+                  width=3)
 
-            # 绘制数据点标记 (圆点)
-            for x, y in max_points:
-                draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='red', outline='darkred')
-            for x, y in avg_points:
-                draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='blue', outline='darkblue')
+        # ----- 6. 绘制刻度和标签 -----
+        max_x_ticks = 10
+        step = max(1, len(gens) // max_x_ticks)
+        for i in range(0, len(gens), step):
+            gen = gens[i]
+            x = map_x(gen)
+            draw.line([(x, height - margin_bottom), (x, height - margin_bottom + 5)], fill='black', width=2)
+            draw.text((x - 10, height - margin_bottom + 10), str(gen), fill='black', font=small_font)
 
-            # 添加图例
-            draw.rectangle([width - 150, 40, width - 20, 90], outline='black', width=2)
-            draw.ellipse([width - 140, 52, width - 120, 72], fill='red')
-            draw.text((width - 110, 55), "Max Fitness", fill='black', font=small_font)
-            draw.ellipse([width - 140, 77, width - 120, 97], fill='blue')
-            draw.text((width - 110, 80), "Avg Fitness", fill='black', font=small_font)
+        if len(gens) > 1 and (len(gens) - 1) % step != 0:
+            x = map_x(gens[-1])
+            draw.line([(x, height - margin_bottom), (x, height - margin_bottom + 5)], fill='black', width=2)
+            draw.text((x - 10, height - margin_bottom + 10), str(gens[-1]), fill='black', font=small_font)
 
-            # ----- 6. 转换为 Ursina Texture -----
-            # 将 PIL Image 转为 bytes
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format='PNG')
-            img_bytes.seek(0)
+        # 左Y轴刻度 (Max Fitness)
+        for i in range(5):
+            t = i / 4
+            val = y1_min + t * (y1_max - y1_min)
+            y = map_y_left(val)
+            draw.line([(margin_left - 5, y), (margin_left, y)], fill='red', width=2)
+            draw.text((margin_left - 75, y - 8), f'{val:.1f}', fill='red', font=small_font)
 
-            # 创建纹理
-            texture = Texture(img)
-            return texture
-            # texture = Texture(img_bytes.getvalue())
-            # return texture
+        # 右Y轴刻度 (Avg Fitness)
+        for i in range(5):
+            t = i / 4
+            val = y2_min + t * (y2_max - y2_min)
+            y = map_y_right(val)
+            draw.line([(width - margin_right, y), (width - margin_right + 5, y)], fill='blue', width=2)
+            draw.text((width - margin_right + 12, y - 8), f'{val:.1f}', fill='blue', font=small_font)
 
+        # 轴标题
+        draw.text((width // 2 - 50, height - 35), "Generation", fill='black', font=font)
+        draw.text((20, margin_top - 40), "Max Fitness (Left)", fill='red', font=font)
+        draw.text((width - 220, margin_top - 40), "Avg Fitness (Right)", fill='blue', font=font)
+
+        # ----- 7. 绘制双轴折线 -----
+        # 左轴曲线 (红色)
+        max_points = [(map_x(g), map_y_left(v)) for g, v in zip(gens, max_vals)]
+        if len(max_points) > 1:
+            draw.line(max_points, fill='red', width=4)
+        for x, y in max_points:
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill='red')
+
+        # 右轴曲线 (蓝色)
+        avg_points = [(map_x(g), map_y_right(v)) for g, v in zip(gens, avg_vals)]
+        if len(avg_points) > 1:
+            draw.line(avg_points, fill='blue', width=4)
+        for x, y in avg_points:
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill='blue')
+        self.img = img
+        # ----- 8. 返回 Ursina 纹理 -----
+        return Texture(img)
     "==========更新函数========"  # 此局开始到 下一代生成过程，均在这里
     def update(self):
         self.step_count += 1
@@ -516,26 +711,105 @@ class Population:
             # self.text[idc].look_at(camera)
             idc += 1
 
-        """
-          self.alive = True
-        self.hp = HP_INIT
-        self.energy = ENERGY_INIT
-        self.kills = 0
-        self.survival_time = 0.0
-        self.attack_cooldown = 0.0
-        self.speed = 0.0
-        """
+
         # 达到终止条件则进化
         if len(self.creatures) == 0 or self.step_count >= MAX_STEPS:
             self.evolve()
-            new_tex = self.draw_line()
-            self.fig.texture = new_tex
+            self.fig.texture = self.draw_line()
+            # new_tex = self.draw_line()
+            # self.fig.texture = new_tex
+
+    def save_data(self, is_snapshot=False):
+        """保存末代优秀DNA（降序）与统计图表
+        is_snapshot: 为 True 代表快捷键快照（不影响后续运行），False 代表退出保存
+        """
+        label = "手动快照" if is_snapshot else "退出退出"
+        print(f"\n[系统提示] 触发【{label}】，正在保存当前演化成果...")
+
+        # 1. 收集并计算当前所有个体的即时适应度
+        current_records = []
+        for c in self.creatures:
+            fit = (
+                    (c.survival_step / max(1, self.step_count)) * 存活时间在适应度中的权重
+                    + c.kills * 击杀数在适应度中的权重
+                    + (c.hp / HP_INIT) * hp在适应度中的权重
+            )
+            current_records.append({
+                "fitness": float(fit),
+                "kills": int(c.kills),
+                "dna": c.dna.tolist()
+            })
+
+        for dna, fit in self.dead_records:
+            current_records.append({
+                "fitness": float(fit),
+                "kills": 0,
+                "dna": dna.tolist()
+            })
+
+        if not current_records:
+            print("[警告] 没有找到任何个体数据，取消保存。")
+            return
+
+        # 2. 按适应度【降序】排列
+        current_records.sort(key=lambda x: x["fitness"], reverse=True)
+
+        # 3. 文件命名区分（快照会带上标记，防止覆盖）
+        suffix = "_snapshot" if is_snapshot else ""
+        dna_filename = f"generation_{self.generation}{suffix}_dna_list.json"
+        img_filename = f"generation_{self.generation}{suffix}_fitness_chart.png"
+
+        # 4. 保存 JSON 基因库
+        try:
+            with open(dna_filename, "w", encoding="utf-8") as f:
+                json.dump(current_records, f, indent=4, ensure_ascii=False)
+            print(f" 成功：当前第 {self.generation} 代共 {len(current_records)} 个基因已保存 -> {dna_filename}")
+        except Exception as e:
+            print(f" 失败：保存基因文件时出错: {e}")
+
+        # 5. 保存统计图表图片
+        try:
+            if self.img:
+                self.img.save(img_filename)
+                print(f" 成功：双Y轴统计图表已保存 -> {img_filename}")
+            else:
+                print(" 提示：当前图表尚未生成（可能还在第一代运行中），未截取到图表。")
+        except Exception as e:
+            print(f" 失败：保存统计图表时出错: {e}")
+
+
+
+
+# ========== 【新增】绑定窗口关闭事件 ==========
+
+# ========== 【新增】绑定快捷键与窗口关闭事件 ==========
+def input(key):
+    """全局键盘事件监听"""
+    # 拦截 Ctrl + S 组合键
+    # 触发条件：当按下的键是 's'，并且同时按住了 'control'
+    if key == 's' and held_keys['control']:
+        if 'population' in globals():
+            population.save_data(is_snapshot=True) # 触发快照保存
+
+def on_destroy():
+    """当用户点击关闭按钮时触发自动保存"""
+    if 'population' in globals():
+        population.save_data(is_snapshot=False) # 触发最终存档
+
+
+def on_destroy():
+    """当用户点击关闭按钮、或者程序正常/异常退出时触发"""
+    if 'population' in globals():
+        population.save_data()
+        print('===')
+# 将这个函数注册到 Ursina 系统的退出事件中
 
 
 # ========== 启动 Ursina ==========
 app = Ursina()
 window.title = 'Genetic Algorithm Battle'
 window.borderless = False
+
 
 
 
@@ -564,7 +838,7 @@ camera.position = (0, 60, -60)
 camera.rotation = (45, 0, 0)
 
 # 信息显示
-info = Text(text='', position=(-0.8, 0.45), scale=1.5, background=True)
+info = Text(text='', position=(-0.8, 0.45), scale=1, background=True)
 
 
 population = Population()
@@ -573,12 +847,17 @@ population = Population()
 def update():
     picture.look_at(camera)
     population.update()
-    info.text = (f'Generation: {population.generation}\n'
-                 f'Alive: {len(population.creatures)}\n'
-                 f'Steps: {population.step_count}\n'
-                 f'Gen:{population.generation} | max fitness:{population.max_fitness}'
-                 f' | max kill:{population.max_kill}'
-                 )
+    info.text = f'Alive: {len(population.creatures)} | Steps: {population.step_count}/{MAX_STEPS} | {round(population.step_count*100/MAX_STEPS, 1)}% | Gen:{population.generation} | max fitness:{round(population.max_fitness, 2)} | average_fitness:{round(population.average_fitness, 2)} | max kill:{population.max_kill} | live:{len(population.creatures)} | killed:{len(population.death_creatures)}'
 
+    # info.text = (f'Alive: {len(population.creatures)}\n'
+    #
+    #              f'Steps: {population.step_count}\n'
+    #
+    #              f'Gen:{population.generation} | max fitness:{population.max_fitness} | average_fitness:{population.average_fitness}'
+    #
+    #              f' | max kill:{population.max_kill}'
+    #
+    #              )
 
+app.on_destroy = on_destroy
 app.run()
