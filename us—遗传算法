@@ -7,9 +7,9 @@ import random
 import numpy as np
 
 # ========== 参数设置 ==========
-POP_SIZE = 50  # 种群数量
-MAX_STEPS = 3000  # 每代最大运行帧数
-VISION_RANGE = 20  # 视野半径
+POP_SIZE = 30  # 种群数量
+MAX_STEPS = 1000  # 每代最大运行帧数
+VISION_RANGE = 50  # 视野半径
 MAX_SPEED = 10.0  # 最大移动速度
 MAX_TURN = 120.0  # 最大转向速度(度/秒)
 ATTACK_RANGE = 2.5  # 攻击距离
@@ -17,27 +17,29 @@ ATTACK_COOLDOWN = 0.5  # 攻击冷却(秒)
 ATTACK_DAMAGE = 3  # 每次攻击伤害
 HP_INIT = 10  # 初始生命值
 ENERGY_INIT = 100.0  # 初始能量
-METABOLISM = 1.0  # 每秒能量消耗
+METABOLISM = 2.0  # 每秒能量消耗
 单次攻击所消耗的能量 = 5
-KILL_ENERGY = 20.0  # 杀死敌人获得的能量
+KILL_ENERGY = 200.0  # 杀死敌人获得的能量
 击杀治愈 = 5
-MAX_ENERGY = 200.0  # 能量上限
+MAX_ENERGY = 1000.0  # 能量上限
 
-存活时间在适应度中的权重 = 10
-击杀数在适应度中的权重 = 500
-hp在适应度中的权重 = 10
+存活时间在适应度中的权重 = 10     # 此值为最大贡献值
+击杀数在适应度中的权重 = 500     # 单个击杀对饮的贡献值
+hp在适应度中的权重 = 10         # 此值为最大贡献值
 
-INPUT_NODES = 6  # 神经网络输入层
+INPUT_NODES = 15  # 神经网络输入层
 HIDDEN_NODES = 8  # 隐藏层节点数
 HIDDEN_NUMBER = 3  # 隐藏层层数
 OUTPUT_NODES = 3  # 输出层(转向、加速、攻击)
 
-MUTATION_RATE = 0.1  # 每个基因变异概率
-MUTATION_SCALE = 0.5  # 变异幅度
-ELITE_COUNT = 10  # 精英保留数量
+MUTATION_RATE = 0.3  # 每个基因变异概率
+MUTATION_SCALE = 0.6  # 变异幅度
+ELITE_COUNT = 5  # 精英保留数量
 CROSSOVER_RATE = 0.7  # 交叉概率
 BOUNDARY = 50  # 平面边界
 
+是否载入dna数据 = 'n'
+file_path = 'generation_389_snapshot_dna_list.json'
 # 根据 HIDDEN_NUMBER 动态计算基因长度
 def calc_gene_length():
     length = INPUT_NODES * HIDDEN_NODES          # input -> first hidden
@@ -103,9 +105,16 @@ class Creature(Entity):
 
         # 基因初始化（dna 为一维向量，）
         if dna is None:
-            self.dna = np.random.randn(GENE_LENGTH) * 0.5
+            if 是否载入dna数据 == 'y':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    print('读取成功')
+                self.dna = np.array(data[0].get('dna'))
+            else:
+                self.dna = np.random.randn(GENE_LENGTH) * 0.5
         else:
             self.dna = np.array(dna)
+
         self.decode_weights()   # 转为该个体的权重
 
         # 随机初始朝向
@@ -146,39 +155,7 @@ class Creature(Entity):
         self.weights.append(W_out)
         self.biases.append(b_out)
 
-    # def get_senses(self):
-    #     """获取感知输入：最近敌人的相对位置、距离、自身能量"""
-    #     others = [c for c in self.population.creatures if c is not self and c.alive]  # 存活生物列表
-    #     if not others:
-    #         r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY,self.hp, 1.0])
-    #         if r.shape[0] != INPUT_NODES:
-    #             print('输入与输出结构不对')
-    #         return r
-    #
-    #     closest = min(others, key=lambda c: distance(self, c))      # 获取最近的生物
-    #     dist = distance(self, closest)     # 最近生物的运动方向
-    #     if dist > VISION_RANGE:
-    #         r = np.array([0.0, 0.0, 0.0, self.energy / MAX_ENERGY, self.hp, 1.0])
-    #         if r.shape[0] != INPUT_NODES:
-    #             print('输入与输出结构不对')
-    #         return r
-    #     # 计算相对位置
-    #     rel_x = closest.x - self.x
-    #     rel_z = closest.z - self.z
-    #
-    #     # print('id', 'x:', rel_x / VISION_RANGE,'|' ,'z:', rel_z / VISION_RANGE, '|', 'dist:',
-    #     #                  dist / VISION_RANGE, '|', 'e:',
-    #     #                  self.energy / MAX_ENERGY, '|', 'h:',
-    #     #                  self.hp / 10, '|', '1:',
-    #     #                  1.0)
-    #     return np.array([rel_x / VISION_RANGE,
-    #                      rel_z / VISION_RANGE,
-    #                      dist / VISION_RANGE,
-    #                      max(0, self.energy) / MAX_ENERGY,
-    #                      self.hp / 10,
-    #                      1.0])
-
-    def get_senses(self):
+    def get_sense_0(self):
         """获取感知输入：转换世界相对坐标为基于自身车头朝向的局部相对坐标"""
         # 获取所有存活的敌对生物
         others = [c for c in self.population.creatures if c is not self and c.alive]
@@ -186,6 +163,7 @@ class Creature(Entity):
         # 兜底：如果没有其他生物，给神经网络输入默认值（全0，维持当前状态）
         if not others:
             return np.array([
+                0.,
                 0.0, 0.0,  # 局部相对位置 (前/后, 右/左)
                 1.0,  # 距离归一化（1.0表示极远或没有目标）
                 max(0.0, self.energy) / MAX_ENERGY,
@@ -200,6 +178,7 @@ class Creature(Entity):
         # 兜底：如果敌人超出了视野范围
         if dist > VISION_RANGE:
             return np.array([
+                0.0,
                 0.0, 0.0,
                 1.0,
                 max(0.0, self.energy) / MAX_ENERGY,
@@ -231,6 +210,7 @@ class Creature(Entity):
         # ========== 组装输入向量 ==========
         # 所有输入范围均控制在 [-1.0, 1.0] 之间，极度利于神经网络收敛
         return np.array([
+            closest.hp,
             forward_component,  # 前后感受：1.0(正前), -1.0(正后)
             right_component,  # 左右感受：1.0(正右), -1.0(正左)
             dist / VISION_RANGE,  # 距离感受：0.0(贴脸), 1.0(视野边缘)
@@ -238,6 +218,60 @@ class Creature(Entity):
             self.hp / HP_INIT,  # 自身血量比例 [0, 1]
             1.0  # 偏置项
         ])
+
+    def get_senses(self):
+        """获取感知输入：转换世界相对坐标为基于自身车头朝向的局部相对坐标"""
+        def _relative_info(target):
+            """计算目标相对于自身的局部坐标信息
+            返回：(forward_component, right_component, distance_normalized)
+            """
+            to_target = target.position - self.position
+            dist = distance(self, target)
+            dist_norm = dist / VISION_RANGE
+
+            # 计算水平方向上的单位方向向量（忽略y轴）
+            to_target_2d = Vec3(to_target.x, 0, to_target.z)
+            if to_target_2d.length() > 0:
+                to_target_2d = to_target_2d.normalized()
+            else:
+                to_target_2d = Vec3(0, 0, 0)
+
+            my_forward = self.forward.normalized()
+            forward_component = my_forward.dot(to_target_2d)
+            cross_product = my_forward.cross(to_target_2d)
+            right_component = cross_product.y  # 叉积的y分量表示左右方向
+
+            return forward_component, right_component, dist_norm
+
+        # ========== 2. 敌人感知（视野内非亲属、非自身，取最近3个） ==========
+        MAX_ENEMIES = 3
+        enemies = []
+        for c in self.population.creatures:
+            if c is self :
+                continue
+            if distance(self, c) < VISION_RANGE:
+                enemies.append(c)
+        # 按距离排序，取最近的 MAX_ENEMIES 个
+        enemies.sort(key=lambda e: distance(self, e))
+        enemies = enemies[:MAX_ENEMIES]
+
+        enemy_senses = []
+        for enemy in enemies:
+            fwd, right, dist_norm = _relative_info(enemy)
+            enemy_senses.extend([enemy.hp, fwd, right, dist_norm])
+        # 不足 MAX_ENEMIES 个时填充0
+        while len(enemy_senses) < MAX_ENEMIES * 3:
+            enemy_senses.extend([0.0, 0.0, 0.0, 0.0])
+
+        # ========== 3. 自身属性 ==========
+        self_senses = [
+            max(0.0, self.energy) / MAX_ENERGY,
+            self.hp / HP_INIT,
+            1.0  # 偏置项
+        ]
+
+        # 合并所有感知
+        return np.array(enemy_senses + self_senses)
     def think(self, inputs):
         # 隐藏层传播
         hidden = np.array(inputs)
@@ -286,6 +320,8 @@ class Creature(Entity):
         if self.energy <= 0:  # 能量为0时， 扣生命值，不断减少速度
             self.max_speed = MAX_SPEED * self.hp /HP_INIT
             self.hp -= 0.001
+        else:
+            self.max_speed = MAX_SPEED
         if self.hp <= 0 :  # 能量或生命值低于0时触发死亡
             self.die()
             return
@@ -439,135 +475,6 @@ class Population:
         return self.dead_records[-1][0]
 
     "==========统计图========="
-    # def draw_line(self):
-    #         """根据当前数据生成折线统计图的纹理"""
-    #         # ----- 1. 数据准备 -----
-    #         gens = list(range(1, len(self.max_fitness_s) + 1))
-    #         max_vals = self.max_fitness_s
-    #         avg_vals = self.average_fitness_s
-    #         if not gens :
-    #             # 无数据时返回空白纹理
-    #             return Texture('white_cube')
-    #
-    #         # ----- 2. 图片参数 -----
-    #         width, height = 800, 600  # 图片分辨率
-    #         margin = 80  # 四周留白（用于绘制坐标轴标签）
-    #         plot_width = width - 2 * margin
-    #         plot_height = height - 2 * margin
-    #
-    #         # 坐标范围
-    #         x_min, x_max = min(gens), max(gens)
-    #         y_min = min(min(max_vals), min(avg_vals))
-    #         y_max = max(max(max_vals), max(avg_vals))
-    #         # 留出一些边距，避免线条贴边
-    #         y_padding = (y_max - y_min) * 0.1
-    #         y_min -= y_padding
-    #         y_max += y_padding
-    #         if y_min == y_max:
-    #             y_min, y_max = y_min - 1, y_max + 1
-    #
-    #         # 映射函数：数据坐标 -> 图片像素坐标
-    #         if x_max == x_min:
-    #             # 只有一个数据点，固定X坐标在绘图区域中央
-    #             def map_x(gen):
-    #                 return margin + plot_width / 2
-    #         else:
-    #             def map_x(gen):
-    #                 return margin + (gen - x_min) / (x_max - x_min) * plot_width
-    #
-    #         if y_max == y_min:
-    #             def map_y(value):
-    #                 return height - margin - plot_height / 2
-    #         else:
-    #             def map_y(value):
-    #                 return height - margin - (value - y_min) / (y_max - y_min) * plot_height
-    #
-    #         # ----- 3. 创建空白图片并绘制 -----
-    #         img = Image.new('RGBA', (width, height), (255, 255, 255, 255))  # 白色背景
-    #         draw = ImageDraw.Draw(img)
-    #
-    #         # 尝试加载字体（如果没有系统字体，可以使用默认）
-    #         try:
-    #             font = ImageFont.truetype("arial.ttf", 24)
-    #             small_font = ImageFont.truetype("arial.ttf", 18)
-    #         except:
-    #             font = ImageFont.load_default()
-    #             small_font = font
-    #
-    #         # ----- 4. 绘制坐标轴 -----
-    #         # X 轴 (水平线)
-    #         draw.line([(margin, height - margin), (width - margin, height - margin)], fill='black', width=3)
-    #         # Y 轴 (垂直线)
-    #         draw.line([(margin, margin), (margin, height - margin)], fill='black', width=3)
-    #
-    #
-    #         # 绘制 X 轴刻度标签
-    #         max_ticks = max(5, int(plot_width // 50))  # 每50px一个标签，最多至少5个
-    #         step = max(1, len(gens) // max_ticks)
-    #         tick_gens = gens[::step]
-    #         if gens[0] not in tick_gens:
-    #             tick_gens.insert(0, gens[0])
-    #         if gens[-1] not in tick_gens:
-    #             tick_gens.append(gens[-1])
-    #
-    #         for gen in tick_gens:
-    #             x = map_x(gen)
-    #             draw.line([(x, height - margin - 5), (x, height - margin + 5)], fill='black', width=2)
-    #             # 绘制文本，尝试居中对齐
-    #             text_str = str(gen)
-    #             try:
-    #                 # Pillow 10.0+ 支持 getlength
-    #                 text_w = small_font.getlength(text_str)
-    #             except AttributeError:
-    #                 # 回退方法：每个字符大约宽度为字体大小的一半
-    #                 text_w = len(text_str) * (small_font.size if hasattr(small_font, 'size') else 12) * 0.6
-    #             draw.text((x - text_w / 2, height - margin + 8), text_str, fill='black', font=small_font)
-    #
-    #         # 绘制 Y 轴刻度标签（简单取5个等分点）
-    #         for i in range(5):
-    #             t = i / 4
-    #             value = y_min + t * (y_max - y_min)
-    #             y = map_y(value)
-    #             draw.line([(margin - 5, y), (margin + 5, y)], fill='black', width=2)
-    #             draw.text((margin - 50, y - 12), f'{value:.2f}', fill='black', font=small_font)
-    #
-    #         # 坐标轴标题
-    #         draw.text((width // 2 - 30, height - 30), "Generation", fill='black', font=font)
-    #         # 旋转Y轴标题需要单独处理，这里简单写竖排？可以画个文本框，不细究
-    #         draw.text((20, height // 2), "Fitness", fill='black', font=font, angle=90)
-    #
-    #         # ----- 5. 绘制折线 -----
-    #         # 最大适应度折线 (红色)
-    #         max_points = [(map_x(g), map_y(v)) for g, v in zip(gens, max_vals)]
-    #         draw.line(max_points, fill='red', width=4, joint='curve')
-    #         # 平均适应度折线 (蓝色)
-    #         avg_points = [(map_x(g), map_y(v)) for g, v in zip(gens, avg_vals)]
-    #         draw.line(avg_points, fill='blue', width=4, joint='curve')
-    #
-    #         # 绘制数据点标记 (圆点)
-    #         for x, y in max_points:
-    #             draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='red', outline='darkred')
-    #         for x, y in avg_points:
-    #             draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill='blue', outline='darkblue')
-    #
-    #         # 添加图例
-    #         draw.rectangle([width - 150, 40, width - 20, 90], outline='black', width=2)
-    #         draw.ellipse([width - 140, 52, width - 120, 72], fill='red')
-    #         draw.text((width - 110, 55), "Max Fitness", fill='black', font=small_font)
-    #         draw.ellipse([width - 140, 77, width - 120, 97], fill='blue')
-    #         draw.text((width - 110, 80), "Avg Fitness", fill='black', font=small_font)
-    #
-    #         # ----- 6. 转换为 Ursina Texture -----
-    #         # 将 PIL Image 转为 bytes
-    #         img_bytes = io.BytesIO()
-    #         img.save(img_bytes, format='PNG')
-    #         img_bytes.seek(0)
-    #
-    #         # 创建纹理
-    #         texture = Texture(img)
-    #         return texture
-    #         # texture = Texture(img_bytes.getvalue())
-    #         # return texture
     def draw_line(self):
         """根据当前数据生成【双Y轴】折线统计图的纹理（已修复 TypeError 和除零崩溃）"""
         gens = list(range(1, len(self.max_fitness_s) + 1))
@@ -849,15 +756,6 @@ def update():
     population.update()
     info.text = f'Alive: {len(population.creatures)} | Steps: {population.step_count}/{MAX_STEPS} | {round(population.step_count*100/MAX_STEPS, 1)}% | Gen:{population.generation} | max fitness:{round(population.max_fitness, 2)} | average_fitness:{round(population.average_fitness, 2)} | max kill:{population.max_kill} | live:{len(population.creatures)} | killed:{len(population.death_creatures)}'
 
-    # info.text = (f'Alive: {len(population.creatures)}\n'
-    #
-    #              f'Steps: {population.step_count}\n'
-    #
-    #              f'Gen:{population.generation} | max fitness:{population.max_fitness} | average_fitness:{population.average_fitness}'
-    #
-    #              f' | max kill:{population.max_kill}'
-    #
-    #              )
 
 app.on_destroy = on_destroy
 app.run()
